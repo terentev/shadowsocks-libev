@@ -48,6 +48,14 @@
 #define DEFAULT_PACKET_SIZE 1397 // 1492 - PACKET_HEADER_SIZE = 1397, the default MTU for UDP relay
 #define MAX_ADDR_HEADER_SIZE (1 + 256 + 2) // 1-byte atyp + 256-byte hostname + 2-byte port
 
+#if defined(MODULE_REMOTE) && defined(__linux__) && !defined(__ANDROID__)
+#define UDP_RESPONSE_BATCH_SIZE 32
+struct udp_response {
+    buffer_t *buf;
+    struct sockaddr_storage addr;
+};
+#endif
+
 typedef struct server_ctx {
     ev_io io;
     int fd;
@@ -64,6 +72,12 @@ typedef struct server_ctx {
 #endif
 #ifdef MODULE_REMOTE
     struct ev_loop *loop;
+#endif
+#ifdef UDP_RESPONSE_BATCH_SIZE
+    ev_check response_check;
+    unsigned int response_count;
+    struct udp_response responses[UDP_RESPONSE_BATCH_SIZE];
+    buffer_t *response_read_bufs[UDP_RESPONSE_BATCH_SIZE];
 #endif
 } server_ctx_t;
 

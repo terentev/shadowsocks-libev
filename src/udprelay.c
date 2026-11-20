@@ -766,52 +766,83 @@ void convert_ipv4_mapped_ipv6(struct sockaddr_storage* addr) {
     }
 }
 
+#ifdef UDP_RESPONSE_BATCH_SIZE
 static void
-remote_recv_cb(EV_P_ ev_io *w, int revents)
+flush_responses(server_ctx_t *server_ctx)
 {
-    ssize_t r;
-    remote_ctx_t *remote_ctx = (remote_ctx_t *)w;
-    server_ctx_t *server_ctx = remote_ctx->server_ctx;
-
-    // server has been closed
-    if (server_ctx == NULL) {
-        LOGE("[udp] invalid server");
-        close_and_free_remote(EV_A_ remote_ctx);
+    unsigned int count = server_ctx->response_count;
+    if (count == 0) {
         return;
     }
 
-    if (verbose) {
-        LOGI("[udp] remote receive a packet");
-    }
+    unsigned int sent = 0;
+    if (count > 1) {
+        struct mmsghdr messages[UDP_RESPONSE_BATCH_SIZE];
+        struct iovec iov[UDP_RESPONSE_BATCH_SIZE];
 
-    struct sockaddr_storage src_addr;
-    socklen_t src_addr_len = sizeof(struct sockaddr_storage);
-    memset(&src_addr, 0, src_addr_len);
+        for (unsigned int i = 0; i < count; i++) {
+            struct udp_response *response = &server_ctx->responses[i];
+            iov[i] = (struct iovec){ .iov_base = response->buf->data, .iov_len = response->buf->len };
+            messages[i] = (struct mmsghdr){
+                .msg_hdr = {
+                    .msg_name = &response->addr,
+                    .msg_namelen = get_sockaddr_len((struct sockaddr *)&response->addr),
+                    .msg_iov = &iov[i],
+                    .msg_iovlen = 1,
+                },
+            };
+        }
 
-    buffer_t *buf = ss_malloc(sizeof(buffer_t));
-    balloc(buf, buf_size);
-
-    // recv
-    r = recvfrom(remote_ctx->fd, buf->data, buf_size, 0, (struct sockaddr *)&src_addr, &src_addr_len);
-
-    if (r == -1) {
-        // error on recv
-        // simply drop that packet
-        ERROR("[udp] remote_recv_recvfrom");
-        goto CLEAN_UP;
-    } else if (r > packet_size) {
-        if (verbose) {
-            LOGI("[udp] remote_recv_recvfrom fragmentation, MTU at least be: " SSIZE_FMT, r + PACKET_HEADER_SIZE);
+        int result = sendmmsg(server_ctx->fd, messages, count, 0);
+        if (result >= 0) {
+            sent = (unsigned int)result;
         }
     }
 
-    buf->len = r;
+    /* A short batch can hide the error on the next datagram. Try each
+     * unsent response once so one invalid destination does not block others. */
+    for (unsigned int i = sent; i < count; i++) {
+        struct udp_response *response = &server_ctx->responses[i];
+        struct sockaddr *addr = (struct sockaddr *)&response->addr;
+        if (sendto(server_ctx->fd, response->buf->data, response->buf->len, 0,
+                   addr, get_sockaddr_len(addr)) == -1
+                && errno != EAGAIN && errno != EWOULDBLOCK) {
+            ERROR("[udp] remote_recv_sendto");
+        }
+    }
+
+    for (unsigned int i = 0; i < count; i++) {
+        bfree(server_ctx->responses[i].buf);
+        ss_free(server_ctx->responses[i].buf);
+    }
+    server_ctx->response_count = 0;
+}
+
+static void
+response_check_cb(EV_P_ ev_check *w, int revents)
+{
+    server_ctx_t *server_ctx = cork_container_of(w, server_ctx_t, response_check);
+    flush_responses(server_ctx);
+}
+#endif
+
+static void
+handle_remote_response(EV_P_ remote_ctx_t *remote_ctx,
+                       struct sockaddr_storage *src_addr, buffer_t *buf)
+{
+    server_ctx_t *server_ctx = remote_ctx->server_ctx;
+    if (verbose) {
+        LOGI("[udp] remote receive a packet");
+        if (buf->len > packet_size) {
+            LOGI("[udp] remote_recv_recvfrom fragmentation, MTU at least be: %zu", buf->len + PACKET_HEADER_SIZE);
+        }
+    }
 
 #ifdef MODULE_LOCAL
     int err = server_ctx->crypto->decrypt_all(buf, server_ctx->crypto->cipher, buf_size);
     if (err) {
         LOGE("failed to handshake with %s: %s",
-                get_addr_str((struct sockaddr *)&src_addr, false), "suspicious UDP packet");
+                get_addr_str((struct sockaddr *)src_addr, false), "suspicious UDP packet");
         // drop the packet silently
         goto CLEAN_UP;
     }
@@ -859,7 +890,7 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
 
     // Reconstruct UDP response header
     char addr_header[MAX_ADDR_HEADER_SIZE];
-    int addr_header_len = construct_udprelay_header(&src_addr, addr_header);
+    int addr_header_len = construct_udprelay_header(src_addr, addr_header);
 
     // Construct packet
     brealloc(buf, buf->len + addr_header_len, buf_size);
@@ -943,6 +974,14 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
     close(src_fd);
 
+#elif defined(UDP_RESPONSE_BATCH_SIZE)
+    unsigned int index = server_ctx->response_count++;
+    server_ctx->responses[index] = (struct udp_response){ .buf = buf, .addr = remote_ctx->src_addr };
+    ev_timer_again(EV_A_ & remote_ctx->watcher);
+    if (server_ctx->response_count == UDP_RESPONSE_BATCH_SIZE) {
+        flush_responses(server_ctx);
+    }
+    return;
 #else
     size_t remote_src_addr_len = get_sockaddr_len((struct sockaddr *)&remote_ctx->src_addr);
 
@@ -963,6 +1002,70 @@ CLEAN_UP:
 
     bfree(buf);
     ss_free(buf);
+}
+
+static void
+remote_recv_cb(EV_P_ ev_io *w, int revents)
+{
+    remote_ctx_t *remote_ctx = (remote_ctx_t *)w;
+    server_ctx_t *server_ctx = remote_ctx->server_ctx;
+    if (server_ctx == NULL) {
+        LOGE("[udp] invalid server");
+        close_and_free_remote(EV_A_ remote_ctx);
+        return;
+    }
+
+#ifdef UDP_RESPONSE_BATCH_SIZE
+    struct mmsghdr messages[UDP_RESPONSE_BATCH_SIZE];
+    struct iovec iov[UDP_RESPONSE_BATCH_SIZE];
+    struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE] = {0};
+
+    for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
+        buffer_t **slot = &server_ctx->response_read_bufs[i];
+        if (*slot == NULL) {
+            *slot = ss_malloc(sizeof(buffer_t));
+            balloc(*slot, buf_size);
+        } else if ((*slot)->capacity < (size_t)buf_size) {
+            brealloc(*slot, buf_size, buf_size);
+        }
+        iov[i] = (struct iovec){ .iov_base = (*slot)->data, .iov_len = buf_size };
+        messages[i] = (struct mmsghdr){
+            .msg_hdr = {
+                .msg_name = &addresses[i],
+                .msg_namelen = sizeof(addresses[i]),
+                .msg_iov = &iov[i],
+                .msg_iovlen = 1,
+            },
+        };
+    }
+
+    /* Read only packets that are already available on this upstream socket. */
+    int count = recvmmsg(remote_ctx->fd, messages, UDP_RESPONSE_BATCH_SIZE, MSG_DONTWAIT, NULL);
+    if (count == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        ERROR("[udp] remote_recv_recvmmsg");
+    }
+    for (int i = 0; i < count; i++) {
+        buffer_t *buf = server_ctx->response_read_bufs[i];
+        server_ctx->response_read_bufs[i] = NULL;
+        buf->len = messages[i].msg_len;
+        handle_remote_response(EV_A_ remote_ctx, &addresses[i], buf);
+    }
+#else
+    struct sockaddr_storage src_addr = {0};
+    socklen_t src_addr_len = sizeof(src_addr);
+    buffer_t *buf = ss_malloc(sizeof(buffer_t));
+    balloc(buf, buf_size);
+    ssize_t received = recvfrom(remote_ctx->fd, buf->data, buf_size, 0,
+                                (struct sockaddr *)&src_addr, &src_addr_len);
+    if (received == -1) {
+        ERROR("[udp] remote_recv_recvfrom");
+        bfree(buf);
+        ss_free(buf);
+        return;
+    }
+    buf->len = received;
+    handle_remote_response(EV_A_ remote_ctx, &src_addr, buf);
+#endif
 }
 
 static void
@@ -1493,6 +1596,12 @@ init_udprelay(const char *server_host, const char *server_port,
 #endif
 
     ev_io_start(loop, &server_ctx->io);
+#ifdef UDP_RESPONSE_BATCH_SIZE
+    ev_check_init(&server_ctx->response_check, response_check_cb);
+    /* Run after the UDP I/O watchers from this poll. */
+    ev_set_priority(&server_ctx->response_check, EV_MINPRI);
+    ev_check_start(loop, &server_ctx->response_check);
+#endif
 
     server_ctx_list[server_num++] = server_ctx;
 
@@ -1506,6 +1615,17 @@ free_udprelay()
     while (server_num > 0) {
         server_ctx_t *server_ctx = server_ctx_list[--server_num];
         ev_io_stop(loop, &server_ctx->io);
+#ifdef UDP_RESPONSE_BATCH_SIZE
+        ev_check_stop(loop, &server_ctx->response_check);
+        flush_responses(server_ctx);
+        for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
+            buffer_t *buf = server_ctx->response_read_bufs[i];
+            if (buf != NULL) {
+                bfree(buf);
+                ss_free(buf);
+            }
+        }
+#endif
         close(server_ctx->fd);
         cache_delete(server_ctx->conn_cache, 0);
 #ifdef MODULE_LOCAL
