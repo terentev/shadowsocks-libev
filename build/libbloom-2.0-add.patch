@@ -1,0 +1,32 @@
+diff --git a/bloom.c b/bloom.c
+index cb9f914..3b56c40 100644
+--- a/bloom.c
++++ b/bloom.c
+@@ -139,0 +140,9 @@ int bloom_check(struct bloom * bloom, const void * buffer, int len)
++/* The next position is (position + stride) % bits. */
++static inline unsigned long next_position(unsigned long position,
++                                          unsigned long stride,
++                                          unsigned long bits)
++{
++  return position >= bits - stride ? position - (bits - stride)
++                                   : position + stride;
++}
++
+@@ -142 +151,16 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
+-  return bloom_check_add(bloom, buffer, len, 1);
++  if (!bloom->ready || bloom->hashes == 0) {
++    return bloom_check_add(bloom, buffer, len, 1);
++  }
++
++  const unsigned long bits = bloom->bits;
++  const unsigned int a = murmurhash2(buffer, len, 0x9747b28c);
++  const unsigned long stride = murmurhash2(buffer, len, a) % bits;
++  unsigned long position = a % bits;
++  unsigned int hits = 0;
++
++  for (unsigned int i = 0; i < bloom->hashes; i++) {
++    hits += test_bit_set_bit(bloom->bf, position, 1);
++    position = next_position(position, stride, bits);
++  }
++
++  return hits == bloom->hashes;
