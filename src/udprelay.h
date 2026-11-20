@@ -50,9 +50,10 @@
 
 #if defined(MODULE_REMOTE) && defined(__linux__) && !defined(__ANDROID__)
 #define UDP_RESPONSE_BATCH_SIZE 32
-struct udp_response {
+struct udp_datagram {
     buffer_t *buf;
     struct sockaddr_storage addr;
+    size_t offset;
 };
 #endif
 
@@ -76,8 +77,9 @@ typedef struct server_ctx {
 #ifdef UDP_RESPONSE_BATCH_SIZE
     ev_check response_check;
     unsigned int response_count;
-    struct udp_response responses[UDP_RESPONSE_BATCH_SIZE];
+    struct udp_datagram responses[UDP_RESPONSE_BATCH_SIZE];
     buffer_t *response_read_bufs[UDP_RESPONSE_BATCH_SIZE];
+    buffer_t *request_read_bufs[UDP_RESPONSE_BATCH_SIZE];
 #endif
 } server_ctx_t;
 
