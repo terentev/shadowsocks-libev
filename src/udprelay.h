@@ -23,6 +23,7 @@
 #ifndef _UDPRELAY_H
 #define _UDPRELAY_H
 
+#include <stdbool.h>
 #include <time.h>
 
 #ifdef HAVE_LIBEV_EV_H
@@ -77,6 +78,7 @@ typedef struct server_ctx {
 #ifdef UDP_RESPONSE_BATCH_SIZE
     ev_check response_check;
     unsigned int response_count;
+    bool response_gso_unavailable;
     struct udp_datagram responses[UDP_RESPONSE_BATCH_SIZE];
     buffer_t *response_read_bufs[UDP_RESPONSE_BATCH_SIZE];
     buffer_t *request_read_bufs[UDP_RESPONSE_BATCH_SIZE];

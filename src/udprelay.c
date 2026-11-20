@@ -54,6 +54,10 @@
 #include "udprelay.h"
 #include "winsock.h"
 
+#ifdef UDP_RESPONSE_BATCH_SIZE
+#include <netinet/udp.h>
+#endif
+
 #ifdef MODULE_REMOTE
 #define MAX_UDP_CONN_NUM 512
 #else
@@ -774,6 +778,15 @@ struct udp_request_batch {
 };
 
 static void
+free_udp_batch(struct udp_datagram *packets, unsigned int count)
+{
+    for (unsigned int i = 0; i < count; i++) {
+        bfree(packets[i].buf);
+        ss_free(packets[i].buf);
+    }
+}
+
+static void
 send_udp_batch(int fd, struct udp_datagram *packets, unsigned int count,
                const char *error, bool ignore_would_block)
 {
@@ -816,11 +829,76 @@ send_udp_batch(int fd, struct udp_datagram *packets, unsigned int count,
         }
     }
 
-    for (unsigned int i = 0; i < count; i++) {
-        bfree(packets[i].buf);
-        ss_free(packets[i].buf);
-    }
+    free_udp_batch(packets, count);
 }
+
+#ifdef UDP_SEGMENT
+/* Short runs still fit in the existing sendmmsg batch. */
+#define UDP_GSO_MIN_SEGMENTS 4
+
+static unsigned int
+response_segment_count(struct udp_datagram *packets, unsigned int count)
+{
+    size_t len = packets[0].buf->len;
+    if (len == 0 || len > MAX_UDP_PACKET_SIZE / UDP_GSO_MIN_SEGMENTS) {
+        return 1;
+    }
+    socklen_t addr_len = get_sockaddr_len((struct sockaddr *)&packets[0].addr);
+    if (addr_len == 0) {
+        return 1;
+    }
+
+    unsigned int limit = MAX_UDP_PACKET_SIZE / len;
+    unsigned int segments = 1;
+    while (segments < count && segments < limit &&
+           packets[segments].buf->len == len &&
+           memcmp(&packets[segments].addr, &packets[0].addr, addr_len) == 0) {
+        segments++;
+    }
+    return segments;
+}
+
+static bool
+send_segmented_responses(server_ctx_t *server_ctx, struct udp_datagram *packets,
+                         unsigned int count)
+{
+    struct iovec iov[UDP_RESPONSE_BATCH_SIZE];
+    for (unsigned int i = 0; i < count; i++) {
+        iov[i] = (struct iovec){
+            .iov_base = packets[i].buf->data,
+            .iov_len = packets[i].buf->len,
+        };
+    }
+
+    union {
+        struct cmsghdr align;
+        unsigned char data[CMSG_SPACE(sizeof(uint16_t))];
+    } control = { .data = {0} };
+    struct msghdr message = {
+        .msg_name = &packets[0].addr,
+        .msg_namelen = get_sockaddr_len((struct sockaddr *)&packets[0].addr),
+        .msg_iov = iov,
+        .msg_iovlen = count,
+        .msg_control = control.data,
+        .msg_controllen = sizeof(control.data),
+    };
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = IPPROTO_UDP;
+    header->cmsg_type = UDP_SEGMENT;
+    header->cmsg_len = CMSG_LEN(sizeof(uint16_t));
+    uint16_t segment_size = (uint16_t)packets[0].buf->len;
+    memcpy(CMSG_DATA(header), &segment_size, sizeof(segment_size));
+
+    if (sendmsg(server_ctx->fd, &message, 0) >= 0) {
+        free_udp_batch(packets, count);
+        return true;
+    }
+    if (errno == ENOPROTOOPT) {
+        server_ctx->response_gso_unavailable = true;
+    }
+    return false;
+}
+#endif
 
 static void
 flush_requests(struct udp_request_batch *batch)
@@ -834,11 +912,30 @@ flush_requests(struct udp_request_batch *batch)
 static void
 flush_responses(server_ctx_t *server_ctx)
 {
-    if (server_ctx->response_count == 0) {
-        return;
+    unsigned int count = server_ctx->response_count;
+    unsigned int pending = 0;
+#ifdef UDP_SEGMENT
+    unsigned int index = 0;
+    while (!server_ctx->response_gso_unavailable && count - index >= UDP_GSO_MIN_SEGMENTS) {
+        struct udp_datagram *packets = server_ctx->responses + index;
+        unsigned int segments = response_segment_count(packets, count - index);
+        if (segments >= UDP_GSO_MIN_SEGMENTS) {
+            if (pending < index) {
+                send_udp_batch(server_ctx->fd, server_ctx->responses + pending, index - pending,
+                               "[udp] remote_recv_sendto", true);
+            }
+            if (!send_segmented_responses(server_ctx, packets, segments)) {
+                send_udp_batch(server_ctx->fd, packets, segments, "[udp] remote_recv_sendto", true);
+            }
+            pending = index + segments;
+        }
+        index += segments;
     }
-    send_udp_batch(server_ctx->fd, server_ctx->responses, server_ctx->response_count,
-                   "[udp] remote_recv_sendto", true);
+#endif
+    if (pending < count) {
+        send_udp_batch(server_ctx->fd, server_ctx->responses + pending, count - pending,
+                       "[udp] remote_recv_sendto", true);
+    }
     server_ctx->response_count = 0;
 }
 
