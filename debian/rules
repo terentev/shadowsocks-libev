@@ -1,0 +1,43 @@
+#!/usr/bin/make -f
+# See debhelper(7) (uncomment to enable)
+# output every command that modifies files on the build system.
+#export DH_VERBOSE = 1
+
+# Security Hardening
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export DEB_CPPFLAGS_MAINT_APPEND = -fPIC
+export DEB_LDFLAGS_MAINT_APPEND = -fPIC
+
+# Dummy folder for autotools scripts
+LIBDIR=libbloom libcork libipset
+
+override_dh_auto_clean:
+	dh_auto_clean
+	# dpkg-buildpackage complains these files from previous built
+	find -name Makefile -exec rm {} \;
+	rm -f config.h config.log config.status libtool shadowsocks-libev.pc stamp-h1
+
+override_dh_autoreconf:
+	# dh_auto_clean and dh_autoreconf complains if there're no these folders
+	# they're removed after dh_autoreconf
+	for libdir in ${LIBDIR}; do \
+		mkdir -p $$libdir; \
+		touch $$libdir/Makefile.in; \
+	done
+	dh_autoreconf
+	rm -rf ${LIBDIR}
+
+override_dh_auto_configure:
+	# Whether to have stack-protector is decided by dpkg-buildflags.
+	# So --disable-ssp here should be safe. See Bug#829498
+	dh_auto_configure -- \
+		--enable-shared \
+		--enable-system-shared-lib \
+		--disable-ssp
+
+execute_before_dh_install:
+	# remove libtool library
+	rm -f debian/tmp/usr/lib/*/*.la
+
+%:
+	dh $@

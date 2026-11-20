@@ -1,0 +1,174 @@
+From: Tristan Schmelcher <tristan.schmelcher@gmail.com>
+Date: Sat, 21 May 2022 20:18:14 -0700
+Subject: Fix --mptcp on kernels with mainlined MPTCP. Mainlined MPTCP on
+ Linux 5.6+ is enabled with IPPROTO_MPTCP rather than setsockopt.
+Forwarded: not-needed
+
+(cherry picked from commit 1630764b02bbcbf0980d8080ea6ee8fd9b2cabf0)
+---
+ src/local.c    | 10 +++++++++-
+ src/netutils.h |  2 ++
+ src/redir.c    | 10 +++++++++-
+ src/server.c   | 10 +++++++++-
+ src/tunnel.c   | 10 +++++++++-
+ 5 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/src/local.c b/src/local.c
+index f873491..ac3a4f0 100644
+--- a/src/local.c
++++ b/src/local.c
+@@ -1268,7 +1268,13 @@ create_remote(listen_ctx_t *listener,
+         remote_addr = addr;
+     }
+ 
+-    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
++    int protocol = IPPROTO_TCP;
++#ifdef IPPROTO_MPTCP
++    if (listener->mptcp > 0) {
++        protocol = IPPROTO_MPTCP;
++    }
++#endif
++    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
+ 
+     if (remotefd == -1) {
+         ERROR("socket");
+@@ -1281,6 +1287,7 @@ create_remote(listen_ctx_t *listener,
+     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+ #endif
+ 
++#ifndef IPPROTO_MPTCP
+     if (listener->mptcp > 1) {
+         int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+         if (err == -1) {
+@@ -1299,6 +1306,7 @@ create_remote(listen_ctx_t *listener,
+             ERROR("failed to enable multipath TCP");
+         }
+     }
++#endif
+ 
+     // Setup
+     setnonblocking(remotefd);
+diff --git a/src/netutils.h b/src/netutils.h
+index 8272419..5360300 100644
+--- a/src/netutils.h
++++ b/src/netutils.h
+@@ -60,12 +60,14 @@ typedef struct {
+     char *port;
+ } ss_addr_t;
+ 
++#ifndef IPPROTO_MPTCP
+ /* MPTCP_ENABLED setsockopt values for kernel 4 & 3, best behaviour to be independant of kernel version is to test from newest to the latest values */
+ #ifndef MPTCP_ENABLED
+ static const char mptcp_enabled_values[] = { 42, 26, 0 };
+ #else
+ static const char mptcp_enabled_values[] = { MPTCP_ENABLED, 0 };
+ #endif
++#endif
+ 
+ #ifndef UPDATE_INTERVAL
+ #define UPDATE_INTERVAL 5
+diff --git a/src/redir.c b/src/redir.c
+index 6118574..7e58a13 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -758,7 +758,13 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     int index                    = rand() % listener->remote_num;
+     struct sockaddr *remote_addr = listener->remote_addr[index];
+ 
+-    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
++    int protocol = IPPROTO_TCP;
++#ifdef IPPROTO_MPTCP
++    if (listener->mptcp > 0) {
++	protocol = IPPROTO_MPTCP;
++    }
++#endif
++    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
+     if (remotefd == -1) {
+         ERROR("socket");
+         return;
+@@ -796,6 +802,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+ #endif
+     }
+ 
++#ifndef IPPROTO_MPTCP
+     // Enable MPTCP
+     if (listener->mptcp > 1) {
+         int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+@@ -815,6 +822,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+             ERROR("failed to enable multipath TCP");
+         }
+     }
++#endif
+ 
+     server_t *server = new_server(serverfd);
+     remote_t *remote = new_remote(remotefd, listener->timeout);
+diff --git a/src/server.c b/src/server.c
+index b48ecf9..3d6d164 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -368,7 +368,13 @@ create_and_bind(const char *host, const char *port, int mptcp)
+     }
+ 
+     for (/*rp = result*/; rp != NULL; rp = rp->ai_next) {
+-        listen_sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
++        int protocol = rp->ai_protocol;
++#ifdef IPPROTO_MPTCP
++        if (mptcp == 1) {
++            protocol = IPPROTO_MPTCP;
++        }
++#endif
++        listen_sock = socket(rp->ai_family, rp->ai_socktype, protocol);
+         if (listen_sock == -1) {
+             continue;
+         }
+@@ -390,6 +396,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
+             }
+         }
+ 
++#ifndef IPPROTO_MPTCP
+         if (mptcp == 1) {
+             int i = 0;
+             while ((mptcp = mptcp_enabled_values[i]) > 0) {
+@@ -403,6 +410,7 @@ create_and_bind(const char *host, const char *port, int mptcp)
+                 ERROR("failed to enable multipath TCP");
+             }
+         }
++#endif
+ 
+         s = bind(listen_sock, rp->ai_addr, rp->ai_addrlen);
+         if (s == 0) {
+diff --git a/src/tunnel.c b/src/tunnel.c
+index eee5234..b3a8b13 100644
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -724,7 +724,13 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     int index                    = rand() % listener->remote_num;
+     struct sockaddr *remote_addr = listener->remote_addr[index];
+ 
+-    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, IPPROTO_TCP);
++    int protocol = IPPROTO_TCP;
++#ifdef IPPROTO_MPTCP
++    if (listener->mptcp > 0) {
++        protocol = IPPROTO_MPTCP;
++    }
++#endif
++    int remotefd = socket(remote_addr->sa_family, SOCK_STREAM, protocol);
+     if (remotefd == -1) {
+         ERROR("socket");
+         return;
+@@ -755,6 +761,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+     setsockopt(remotefd, SOL_SOCKET, SO_NOSIGPIPE, &opt, sizeof(opt));
+ #endif
+ 
++#ifndef IPPROTO_MPTCP
+     if (listener->mptcp > 1) {
+         int err = setsockopt(remotefd, SOL_TCP, listener->mptcp, &opt, sizeof(opt));
+         if (err == -1) {
+@@ -773,6 +780,7 @@ accept_cb(EV_P_ ev_io *w, int revents)
+             ERROR("failed to enable multipath TCP");
+         }
+     }
++#endif
+ 
+     // Setup
+     setnonblocking(remotefd);

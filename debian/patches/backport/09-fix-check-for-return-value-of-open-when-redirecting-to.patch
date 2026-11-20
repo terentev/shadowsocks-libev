@@ -1,0 +1,23 @@
+From: Gilles Depeyrot <g.depeyrot@transacom.fr>
+Date: Thu, 15 Jul 2021 14:43:22 +0200
+Subject: fix check for return value of open when redirecting to null device
+Forwarded: not-needed
+
+(cherry picked from commit 8bcffa54b58411a2beda6acabd5b849518c66841)
+---
+ src/utils.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/utils.c b/src/utils.c
+index 0e94e5d..6ae3b0c 100644
+--- a/src/utils.c
++++ b/src/utils.c
+@@ -470,7 +470,7 @@ daemonize(const char *path)
+     }
+ 
+     int dev_null = open("/dev/null", O_WRONLY);
+-    if (dev_null) {
++    if (dev_null > 0) {
+         /* Redirect to null device  */
+         dup2(dev_null, STDOUT_FILENO);
+         dup2(dev_null, STDERR_FILENO);

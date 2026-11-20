@@ -1,0 +1,26 @@
+From: Boyuan Yang <byang@debian.org>
+Date: Wed, 8 Sep 2021 12:16:06 -0400
+Subject: src/acl.c: Include <libcork/ipset.h> not <libcorkipset/ipset.h>
+Forwarded: not-needed
+
+Latest libcorkipset moved its headers under /usr/include/libcork/
+directory. Use the new location instead.
+
+This avoid #warning triggering build error due to -Werror=cpp.
+---
+ src/acl.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/acl.c b/src/acl.c
+index 1efc1aa..b9f44d7 100644
+--- a/src/acl.c
++++ b/src/acl.c
+@@ -27,7 +27,7 @@
+ #include <ctype.h>
+ 
+ #ifdef USE_SYSTEM_SHARED_LIB
+-#include <libcorkipset/ipset.h>
++#include <libcork/ipset.h>
+ #else
+ #include <ipset/ipset.h>
+ #endif

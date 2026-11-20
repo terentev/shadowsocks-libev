@@ -1,0 +1,54 @@
+From: lixingcong <lixingcong@live.com>
+Date: Wed, 17 Mar 2021 09:44:04 +0800
+Subject: Fix memory leak
+Forwarded: not-needed
+
+---
+ src/redir.c    | 4 ++++
+ src/tunnel.c   | 4 ++++
+ src/udprelay.c | 3 +++
+ 3 files changed, 11 insertions(+)
+
+diff --git a/src/redir.c b/src/redir.c
+index ef43a0e..c4f601a 100644
+--- a/src/redir.c
++++ b/src/redir.c
+@@ -1301,5 +1301,9 @@ main(int argc, char **argv)
+         stop_plugin();
+     }
+ 
++    for (i = 0; i < remote_num; i++)
++        ss_free(listen_ctx.remote_addr[i]);
++    ss_free(listen_ctx.remote_addr);
++
+     return ret_val;
+ }
+diff --git a/src/tunnel.c b/src/tunnel.c
+index a928e61..a65e1ab 100644
+--- a/src/tunnel.c
++++ b/src/tunnel.c
+@@ -1347,6 +1347,10 @@ main(int argc, char **argv)
+         stop_plugin();
+     }
+ 
++    for (i = 0; i < remote_num; i++)
++        ss_free(listen_ctx.remote_addr[i]);
++    ss_free(listen_ctx.remote_addr);
++
+ #ifdef __MINGW32__
+     if (plugin_watcher.valid) {
+         closesocket(plugin_watcher.fd);
+diff --git a/src/udprelay.c b/src/udprelay.c
+index e9d7db0..9c46f14 100644
+--- a/src/udprelay.c
++++ b/src/udprelay.c
+@@ -1467,6 +1467,9 @@ free_udprelay()
+         ev_io_stop(loop, &server_ctx->io);
+         close(server_ctx->fd);
+         cache_delete(server_ctx->conn_cache, 0);
++#ifdef MODULE_LOCAL
++        free((char*) server_ctx->remote_addr);
++#endif
+         ss_free(server_ctx);
+         server_ctx_list[server_num] = NULL;
+     }

@@ -1,0 +1,21 @@
+From: Aron Xu <aron@debian.org>
+Date: Tue, 11 Feb 2025 16:34:07 +0800
+Subject: tests: disable rc4/md5 test which is disabled through weak ciphers
+
+---
+ tests/test.sh | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/tests/test.sh b/tests/test.sh
+index 0221f10..6a0aa10 100755
+--- a/tests/test.sh
++++ b/tests/test.sh
+@@ -35,7 +35,7 @@ fi
+ run_test python3 tests/test.py $BIN -c tests/aes.json
+ run_test python3 tests/test.py $BIN -c tests/aes-gcm.json
+ run_test python3 tests/test.py $BIN -c tests/aes-ctr.json
+-run_test python3 tests/test.py $BIN -c tests/rc4-md5.json
++#run_test python3 tests/test.py $BIN -c tests/rc4-md5.json
+ run_test python3 tests/test.py $BIN -c tests/salsa20.json
+ run_test python3 tests/test.py $BIN -c tests/chacha20.json
+ run_test python3 tests/test.py $BIN -c tests/chacha20-ietf.json
