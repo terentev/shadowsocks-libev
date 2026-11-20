@@ -217,9 +217,13 @@ cache_lookup(struct cache *cache, char *key, size_t key_len, void *result)
 
     HASH_FIND(hh, cache->entries, key, key_len, tmp);
     if (tmp) {
-        HASH_DELETE(hh, cache->entries, tmp);
         tmp->ts = ev_time();
-        HASH_ADD_KEYPTR(hh, cache->entries, tmp->key, key_len, tmp);
+        /* The tail is already the most recently used entry. Removing the
+         * only entry also frees the hash table, which would be rebuilt here. */
+        if (tmp->hh.next != NULL) {
+            HASH_DELETE(hh, cache->entries, tmp);
+            HASH_ADD_KEYPTR(hh, cache->entries, tmp->key, key_len, tmp);
+        }
         *dirty_hack = tmp->data;
     } else {
         *dirty_hack = result = NULL;
