@@ -1,5 +1,5 @@
 diff --git a/bloom.c b/bloom.c
-index cb9f914..21616d9 100644
+index cb9f914..324456f 100644
 --- a/bloom.c
 +++ b/bloom.c
 @@ -139,0 +140,9 @@ int bloom_check(struct bloom * bloom, const void * buffer, int len)
@@ -12,7 +12,7 @@ index cb9f914..21616d9 100644
 +                                   : position + stride;
 +}
 +
-@@ -142 +151,36 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
+@@ -142 +151,47 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
 -  return bloom_check_add(bloom, buffer, len, 1);
 +  if (!bloom->ready || bloom->hashes == 0) {
 +    return bloom_check_add(bloom, buffer, len, 1);
@@ -44,9 +44,20 @@ index cb9f914..21616d9 100644
 +  const unsigned long stride = murmurhash2(buffer, len, a) % bits;
 +  unsigned long position = a % bits;
 +
-+  for (unsigned int i = 0; i < bloom->hashes; i++) {
-+    bloom->bf[position >> 3] |= (unsigned char)(1U << (position & 7U));
-+    position = next_position(position, stride, bits);
++  const unsigned int hashes = bloom->hashes;
++  unsigned char * const bitmap = bloom->bf;
++  unsigned long second = next_position(position, stride, bits);
++  const unsigned long pair_stride = next_position(stride, stride, bits);
++
++  /* Advance the even and odd positions independently by two steps. */
++  for (unsigned int pairs = hashes / 2; pairs != 0; pairs--) {
++    bitmap[position >> 3] |= (unsigned char)(1U << (position & 7U));
++    bitmap[second >> 3] |= (unsigned char)(1U << (second & 7U));
++    position = next_position(position, pair_stride, bits);
++    second = next_position(second, pair_stride, bits);
++  }
++  if (hashes % 2 != 0) {
++    bitmap[position >> 3] |= (unsigned char)(1U << (position & 7U));
 +  }
 +
 +  return 0;
