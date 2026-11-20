@@ -80,8 +80,8 @@ typedef struct server_ctx {
     unsigned int response_count;
     bool response_gso_unavailable;
     struct udp_datagram responses[UDP_RESPONSE_BATCH_SIZE];
-    buffer_t *response_read_bufs[UDP_RESPONSE_BATCH_SIZE];
-    buffer_t *request_read_bufs[UDP_RESPONSE_BATCH_SIZE];
+    struct udp_receive_batch *response_receive;
+    struct udp_receive_batch *request_receive;
 #endif
 } server_ctx_t;
 

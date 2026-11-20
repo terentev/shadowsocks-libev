@@ -1126,37 +1126,67 @@ CLEAN_UP:
 }
 
 #ifdef UDP_RESPONSE_BATCH_SIZE
-static int
-receive_udp_batch(int fd, buffer_t **buffers, struct sockaddr_storage *addresses, const char *error)
-{
+struct udp_receive_batch {
     struct mmsghdr messages[UDP_RESPONSE_BATCH_SIZE];
     struct iovec iov[UDP_RESPONSE_BATCH_SIZE];
+    struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE];
+    buffer_t *buffers[UDP_RESPONSE_BATCH_SIZE];
+};
 
+static struct udp_receive_batch *
+new_receive_batch(void)
+{
+    struct udp_receive_batch *batch = ss_malloc(sizeof(*batch));
+    memset(batch, 0, sizeof(*batch));
     for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
-        buffer_t **slot = &buffers[i];
+        struct msghdr *header = &batch->messages[i].msg_hdr;
+        header->msg_name = &batch->addresses[i];
+        header->msg_iov = &batch->iov[i];
+        header->msg_iovlen = 1;
+    }
+    return batch;
+}
+
+static void
+free_receive_batch(struct udp_receive_batch *batch)
+{
+    for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
+        bfree(batch->buffers[i]);
+        ss_free(batch->buffers[i]);
+    }
+    ss_free(batch);
+}
+
+static int
+receive_udp_batch(int fd, struct udp_receive_batch *batch, const char *error)
+{
+    for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
+        buffer_t **slot = &batch->buffers[i];
         if (*slot == NULL) {
             *slot = ss_malloc(sizeof(buffer_t));
             balloc(*slot, buf_size);
+            batch->iov[i].iov_base = (*slot)->data;
         } else if ((*slot)->capacity < (size_t)buf_size) {
             brealloc(*slot, buf_size, buf_size);
+            batch->iov[i].iov_base = (*slot)->data;
         }
-        iov[i] = (struct iovec){ .iov_base = (*slot)->data, .iov_len = buf_size };
-        messages[i] = (struct mmsghdr){
-            .msg_hdr = {
-                .msg_name = &addresses[i],
-                .msg_namelen = sizeof(addresses[i]),
-                .msg_iov = &iov[i],
-                .msg_iovlen = 1,
-            },
-        };
+        batch->iov[i].iov_len = buf_size;
+        batch->messages[i].msg_hdr.msg_namelen = sizeof(batch->addresses[i]);
     }
 
-    int count = recvmmsg(fd, messages, UDP_RESPONSE_BATCH_SIZE, MSG_DONTWAIT, NULL);
+    int count = recvmmsg(fd, batch->messages, UDP_RESPONSE_BATCH_SIZE, MSG_DONTWAIT, NULL);
     if (count == -1 && errno != EAGAIN && errno != EWOULDBLOCK) {
         ERROR(error);
     }
     for (int i = 0; i < count; i++) {
-        buffers[i]->len = messages[i].msg_len;
+        const struct mmsghdr *message = &batch->messages[i];
+        batch->buffers[i]->len = message->msg_len;
+        size_t addr_len = message->msg_hdr.msg_namelen;
+        struct sockaddr_storage *address = &batch->addresses[i];
+        if (addr_len < sizeof(*address)) {
+            /* The association cache hashes the whole address storage. */
+            memset((char *)address + addr_len, 0, sizeof(*address) - addr_len);
+        }
     }
     return count;
 }
@@ -1174,13 +1204,13 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
 #ifdef UDP_RESPONSE_BATCH_SIZE
-    struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE] = {0};
-    int count = receive_udp_batch(remote_ctx->fd, server_ctx->response_read_bufs, addresses,
+    struct udp_receive_batch *batch = server_ctx->response_receive;
+    int count = receive_udp_batch(remote_ctx->fd, batch,
                                   "[udp] remote_recv_recvmmsg");
     for (int i = 0; i < count; i++) {
-        buffer_t *buf = server_ctx->response_read_bufs[i];
-        server_ctx->response_read_bufs[i] = NULL;
-        handle_remote_response(EV_A_ remote_ctx, &addresses[i], buf);
+        buffer_t *buf = batch->buffers[i];
+        batch->buffers[i] = NULL;
+        handle_remote_response(EV_A_ remote_ctx, &batch->addresses[i], buf);
     }
 #else
     struct sockaddr_storage src_addr = {0};
@@ -1699,15 +1729,15 @@ static void
 server_recv_cb(EV_P_ ev_io *w, int revents)
 {
     server_ctx_t *server_ctx = (server_ctx_t *)w;
-    struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE] = {0};
+    struct udp_receive_batch *received = server_ctx->request_receive;
     struct udp_request_batch batch;
     batch.count = 0;
-    int count = receive_udp_batch(server_ctx->fd, server_ctx->request_read_bufs, addresses,
+    int count = receive_udp_batch(server_ctx->fd, received,
                                   "[udp] server_recv_recvmmsg");
     for (int i = 0; i < count; i++) {
-        buffer_t *buf = server_ctx->request_read_bufs[i];
-        server_ctx->request_read_bufs[i] = NULL;
-        handle_server_request(EV_A_ server_ctx, &addresses[i], buf, &batch);
+        buffer_t *buf = received->buffers[i];
+        received->buffers[i] = NULL;
+        handle_server_request(EV_A_ server_ctx, &received->addresses[i], buf, &batch);
     }
     flush_requests(&batch);
 }
@@ -1777,6 +1807,8 @@ init_udprelay(const char *server_host, const char *server_port,
 
     ev_io_start(loop, &server_ctx->io);
 #ifdef UDP_RESPONSE_BATCH_SIZE
+    server_ctx->request_receive = new_receive_batch();
+    server_ctx->response_receive = new_receive_batch();
     ev_check_init(&server_ctx->response_check, response_check_cb);
     /* Run after the UDP I/O watchers from this poll. */
     ev_set_priority(&server_ctx->response_check, EV_MINPRI);
@@ -1798,12 +1830,8 @@ free_udprelay()
 #ifdef UDP_RESPONSE_BATCH_SIZE
         ev_check_stop(loop, &server_ctx->response_check);
         flush_responses(server_ctx);
-        for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
-            bfree(server_ctx->response_read_bufs[i]);
-            ss_free(server_ctx->response_read_bufs[i]);
-            bfree(server_ctx->request_read_bufs[i]);
-            ss_free(server_ctx->request_read_bufs[i]);
-        }
+        free_receive_batch(server_ctx->response_receive);
+        free_receive_batch(server_ctx->request_receive);
 #endif
         close(server_ctx->fd);
         cache_delete(server_ctx->conn_cache, 0);
