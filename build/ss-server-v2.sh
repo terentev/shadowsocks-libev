@@ -38,7 +38,7 @@ for directory in libcork libipset libbloom; do
     touch "$directory/Makefile.in"
 done
 autoreconf -fi
-CPPFLAGS="-I$scratch/bloom" LDFLAGS="-L$scratch/bloom" \
+CPPFLAGS="-I$scratch/bloom -DSS_USE_BLOOM_INSERT" LDFLAGS="-L$scratch/bloom" \
     CFLAGS="-O2 -g -fno-omit-frame-pointer" \
     ./configure --enable-system-shared-lib --enable-shared --disable-documentation
 make -C src -j4 ss-server

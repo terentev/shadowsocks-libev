@@ -78,8 +78,11 @@ ppbloom_check(const void *buffer, int len)
 int
 ppbloom_add(const void *buffer, int len)
 {
-    int err;
-    err = bloom_add(ppbloom + current, buffer, len);
+#ifdef SS_USE_BLOOM_INSERT
+    int err = bloom_insert(ppbloom + current, buffer, len);
+#else
+    int err = bloom_add(ppbloom + current, buffer, len);
+#endif
     if (err == -1)
         return err;
 

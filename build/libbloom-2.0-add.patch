@@ -1,5 +1,5 @@
 diff --git a/bloom.c b/bloom.c
-index cb9f914..3b56c40 100644
+index cb9f914..21616d9 100644
 --- a/bloom.c
 +++ b/bloom.c
 @@ -139,0 +140,9 @@ int bloom_check(struct bloom * bloom, const void * buffer, int len)
@@ -12,7 +12,7 @@ index cb9f914..3b56c40 100644
 +                                   : position + stride;
 +}
 +
-@@ -142 +151,16 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
+@@ -142 +151,36 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
 -  return bloom_check_add(bloom, buffer, len, 1);
 +  if (!bloom->ready || bloom->hashes == 0) {
 +    return bloom_check_add(bloom, buffer, len, 1);
@@ -30,3 +30,31 @@ index cb9f914..3b56c40 100644
 +  }
 +
 +  return hits == bloom->hashes;
++}
++
++
++int bloom_insert(struct bloom * bloom, const void * buffer, int len)
++{
++  if (!bloom->ready || bloom->hashes == 0) {
++    return bloom_add(bloom, buffer, len);
++  }
++
++  const unsigned long bits = bloom->bits;
++  const unsigned int a = murmurhash2(buffer, len, 0x9747b28c);
++  const unsigned long stride = murmurhash2(buffer, len, a) % bits;
++  unsigned long position = a % bits;
++
++  for (unsigned int i = 0; i < bloom->hashes; i++) {
++    bloom->bf[position >> 3] |= (unsigned char)(1U << (position & 7U));
++    position = next_position(position, stride, bits);
++  }
++
++  return 0;
+diff --git a/bloom.h b/bloom.h
+index 3d7b86b..42f5bc2 100644
+--- a/bloom.h
++++ b/bloom.h
+@@ -128,0 +129,3 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len);
++/* Set the same bits as bloom_add without reporting prior membership. */
++int bloom_insert(struct bloom * bloom, const void * buffer, int len);
++
