@@ -1,8 +1,43 @@
 diff --git a/bloom.c b/bloom.c
-index cb9f914..324456f 100644
+index cb9f914..cdc6c3c 100644
 --- a/bloom.c
 +++ b/bloom.c
-@@ -139,0 +140,9 @@ int bloom_check(struct bloom * bloom, const void * buffer, int len)
+@@ -48,2 +48,9 @@ inline static int test_bit_set_bit(unsigned char * buf,
+-static int bloom_check_add(struct bloom * bloom,
+-                           const void * buffer, int len, int add)
++struct bloom_hash bloom_hash_buffer(const void *buffer, int len)
++{
++  struct bloom_hash hash;
++  hash.a = murmurhash2(buffer, len, 0x9747b28c);
++  hash.b = murmurhash2(buffer, len, hash.a);
++  return hash;
++}
++
++static int bloom_check_add_hash(struct bloom * bloom, struct bloom_hash hash, int add)
+@@ -57,2 +63,0 @@ static int bloom_check_add(struct bloom * bloom,
+-  unsigned int a = murmurhash2(buffer, len, 0x9747b28c);
+-  unsigned int b = murmurhash2(buffer, len, a);
+@@ -63 +68 @@ static int bloom_check_add(struct bloom * bloom,
+-    x = (a + b*i) % bloom->bits;
++    x = (hash.a + hash.b * i) % bloom->bits;
+@@ -79,0 +85,16 @@ static int bloom_check_add(struct bloom * bloom,
++static int bloom_check_add(struct bloom * bloom,
++                           const void * buffer, int len, int add)
++{
++  struct bloom_hash hash = {0};
++  if (bloom->ready) {
++    hash = bloom_hash_buffer(buffer, len);
++  }
++  return bloom_check_add_hash(bloom, hash, add);
++}
++
++int bloom_check_hash(struct bloom *bloom, struct bloom_hash hash)
++{
++  return bloom_check_add_hash(bloom, hash, 0);
++}
++
++
+@@ -139,0 +161,9 @@ int bloom_check(struct bloom * bloom, const void * buffer, int len)
 +/* The next position is (position + stride) % bits. */
 +static inline unsigned long next_position(unsigned long position,
 +                                          unsigned long stride,
@@ -12,7 +47,7 @@ index cb9f914..324456f 100644
 +                                   : position + stride;
 +}
 +
-@@ -142 +151,47 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
+@@ -142 +172,58 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len)
 -  return bloom_check_add(bloom, buffer, len, 1);
 +  if (!bloom->ready || bloom->hashes == 0) {
 +    return bloom_check_add(bloom, buffer, len, 1);
@@ -33,16 +68,11 @@ index cb9f914..324456f 100644
 +}
 +
 +
-+int bloom_insert(struct bloom * bloom, const void * buffer, int len)
++static inline int bloom_insert_positions(struct bloom *bloom, struct bloom_hash hash)
 +{
-+  if (!bloom->ready || bloom->hashes == 0) {
-+    return bloom_add(bloom, buffer, len);
-+  }
-+
 +  const unsigned long bits = bloom->bits;
-+  const unsigned int a = murmurhash2(buffer, len, 0x9747b28c);
-+  const unsigned long stride = murmurhash2(buffer, len, a) % bits;
-+  unsigned long position = a % bits;
++  const unsigned long stride = hash.b % bits;
++  unsigned long position = hash.a % bits;
 +
 +  const unsigned int hashes = bloom->hashes;
 +  unsigned char * const bitmap = bloom->bf;
@@ -61,11 +91,36 @@ index cb9f914..324456f 100644
 +  }
 +
 +  return 0;
++}
++
++int bloom_insert(struct bloom *bloom, const void *buffer, int len)
++{
++  if (!bloom->ready || bloom->hashes == 0) {
++    return bloom_add(bloom, buffer, len);
++  }
++  return bloom_insert_positions(bloom, bloom_hash_buffer(buffer, len));
++}
++
++int bloom_insert_hash(struct bloom *bloom, struct bloom_hash hash)
++{
++  if (!bloom->ready || bloom->hashes == 0) {
++    return bloom_check_add_hash(bloom, hash, 1);
++  }
++  return bloom_insert_positions(bloom, hash);
 diff --git a/bloom.h b/bloom.h
-index 3d7b86b..42f5bc2 100644
+index 3d7b86b..71a2486 100644
 --- a/bloom.h
 +++ b/bloom.h
-@@ -128,0 +129,3 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len);
+@@ -128,0 +129,12 @@ int bloom_add(struct bloom * bloom, const void * buffer, int len);
 +/* Set the same bits as bloom_add without reporting prior membership. */
 +int bloom_insert(struct bloom * bloom, const void * buffer, int len);
++
++/* Reuse the same hashes for checks and insertion of one value. */
++struct bloom_hash {
++  unsigned int a;
++  unsigned int b;
++};
++struct bloom_hash bloom_hash_buffer(const void *buffer, int len);
++int bloom_check_hash(struct bloom *bloom, struct bloom_hash hash);
++int bloom_insert_hash(struct bloom *bloom, struct bloom_hash hash);
 +

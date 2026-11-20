@@ -75,14 +75,9 @@ ppbloom_check(const void *buffer, int len)
     return 0;
 }
 
-int
-ppbloom_add(const void *buffer, int len)
+static int
+ppbloom_record_insertion(int err)
 {
-#ifdef SS_USE_BLOOM_INSERT
-    int err = bloom_insert(ppbloom + current, buffer, len);
-#else
-    int err = bloom_add(ppbloom + current, buffer, len);
-#endif
     if (err == -1)
         return err;
 
@@ -96,6 +91,31 @@ ppbloom_add(const void *buffer, int len)
 
     return 0;
 }
+
+int
+ppbloom_add(const void *buffer, int len)
+{
+#ifdef SS_USE_BLOOM_INSERT
+    return ppbloom_record_insertion(bloom_insert(ppbloom + current, buffer, len));
+#else
+    return ppbloom_record_insertion(bloom_add(ppbloom + current, buffer, len));
+#endif
+}
+
+#ifdef SS_USE_BLOOM_INSERT
+int
+ppbloom_check_hash(struct bloom_hash hash)
+{
+    int ret = bloom_check_hash(ppbloom + PING, hash);
+    return ret ? ret : bloom_check_hash(ppbloom + PONG, hash);
+}
+
+int
+ppbloom_add_hash(struct bloom_hash hash)
+{
+    return ppbloom_record_insertion(bloom_insert_hash(ppbloom + current, hash));
+}
+#endif
 
 void
 ppbloom_free()

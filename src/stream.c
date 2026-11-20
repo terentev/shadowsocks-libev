@@ -479,7 +479,13 @@ stream_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
     uint8_t *nonce = cipher_ctx.nonce;
     memcpy(nonce, ciphertext->data, nonce_len);
 
-    if (ppbloom_check((void *)nonce, nonce_len) == 1) {
+#ifdef SS_USE_BLOOM_INSERT
+    struct bloom_hash hash = bloom_hash_buffer(nonce, nonce_len);
+    int repeated_iv = ppbloom_check_hash(hash);
+#else
+    int repeated_iv = ppbloom_check(nonce, nonce_len);
+#endif
+    if (repeated_iv == 1) {
         LOGE("crypto: stream: repeat IV detected");
         return CRYPTO_ERROR;
     }
@@ -508,7 +514,11 @@ stream_decrypt_all(buffer_t *ciphertext, cipher_t *cipher, size_t capacity)
     dump("NONCE", ciphertext->data, nonce_len);
 #endif
 
-    ppbloom_add((void *)nonce, nonce_len);
+#ifdef SS_USE_BLOOM_INSERT
+    ppbloom_add_hash(hash);
+#else
+    ppbloom_add(nonce, nonce_len);
+#endif
 
     brealloc(ciphertext, plaintext->len, capacity);
     memcpy(ciphertext->data, plaintext->data, plaintext->len);

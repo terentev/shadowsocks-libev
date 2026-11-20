@@ -23,6 +23,12 @@
 #ifndef _PPBLOOM_
 #define _PPBLOOM_
 
+#ifdef SS_USE_BLOOM_INSERT
+#include <bloom.h>
+int ppbloom_check_hash(struct bloom_hash hash);
+int ppbloom_add_hash(struct bloom_hash hash);
+#endif
+
 int ppbloom_init(int entries, double error);
 int ppbloom_check(const void *buffer, int len);
 int ppbloom_add(const void *buffer, int len);
