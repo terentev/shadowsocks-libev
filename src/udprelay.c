@@ -55,6 +55,9 @@
 #include "winsock.h"
 
 #ifdef UDP_RESPONSE_BATCH_SIZE
+#define UDP_RESPONSE_COALESCE_TARGET 4
+#define UDP_RESPONSE_COALESCE_DELAY 0.00025
+
 #include <netinet/udp.h>
 #endif
 
@@ -958,16 +961,33 @@ flush_requests(server_ctx_t *server_ctx, struct udp_request_batch *batch)
 static void
 flush_responses(server_ctx_t *server_ctx)
 {
+    if (ev_is_active(&server_ctx->response_timer) || ev_is_pending(&server_ctx->response_timer)) {
+        ev_timer_stop(server_ctx->loop, &server_ctx->response_timer);
+    }
     send_udp_batch_with_gso(server_ctx->fd, server_ctx->responses, server_ctx->response_count,
                            &server_ctx->response_gso_unavailable, "[udp] remote_recv_sendto", true);
     server_ctx->response_count = 0;
 }
 
 static void
+response_timeout_cb(EV_P_ ev_timer *w, int revents)
+{
+    server_ctx_t *server_ctx = cork_container_of(w, server_ctx_t, response_timer);
+    flush_responses(server_ctx);
+}
+
+static void
 response_check_cb(EV_P_ ev_check *w, int revents)
 {
     server_ctx_t *server_ctx = cork_container_of(w, server_ctx_t, response_check);
-    flush_responses(server_ctx);
+    unsigned int count = server_ctx->response_count;
+    if (count == 1 || count >= UDP_RESPONSE_COALESCE_TARGET) {
+        flush_responses(server_ctx);
+    } else if (count > 1 && !ev_is_active(&server_ctx->response_timer)) {
+        /* Wait briefly for another readable event without delaying singletons. */
+        ev_timer_set(&server_ctx->response_timer, UDP_RESPONSE_COALESCE_DELAY, 0.);
+        ev_timer_start(EV_A_ &server_ctx->response_timer);
+    }
 }
 #endif
 
@@ -1907,6 +1927,7 @@ init_udprelay(const char *server_host, const char *server_port,
 
     ev_io_start(loop, &server_ctx->io);
 #ifdef UDP_RESPONSE_BATCH_SIZE
+    ev_timer_init(&server_ctx->response_timer, response_timeout_cb, 0., 0.);
     ev_check_init(&server_ctx->response_check, response_check_cb);
     /* Run after the UDP I/O watchers from this poll. */
     ev_set_priority(&server_ctx->response_check, EV_MINPRI);

@@ -77,6 +77,7 @@ typedef struct server_ctx {
 #endif
 #ifdef UDP_RESPONSE_BATCH_SIZE
     ev_check response_check;
+    ev_timer response_timer;
     unsigned int response_count;
     bool response_gso_unavailable;
     bool request_gso_unavailable;
