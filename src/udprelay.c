@@ -565,6 +565,20 @@ create_server_socket(const char *host, const char *port)
     return server_sock;
 }
 
+#ifdef UDP_RESPONSE_BATCH_SIZE
+static bool
+enable_udp_gro(int fd)
+{
+#ifdef UDP_GRO
+    int enabled = 1;
+    return setsockopt(fd, IPPROTO_UDP, UDP_GRO, &enabled, sizeof(enabled)) == 0;
+#else
+    (void)fd;
+    return false;
+#endif
+}
+#endif
+
 remote_ctx_t *
 new_remote(int fd, server_ctx_t *server_ctx)
 {
@@ -574,6 +588,9 @@ new_remote(int fd, server_ctx_t *server_ctx)
     ctx->fd         = fd;
     ctx->server_ctx = server_ctx;
     ctx->af         = AF_UNSPEC;
+#ifdef UDP_RESPONSE_BATCH_SIZE
+    ctx->udp_gro = enable_udp_gro(fd);
+#endif
 
     ev_io_init(&ctx->io, remote_recv_cb, fd, EV_READ);
     ev_timer_init(&ctx->watcher, remote_timeout_cb, server_ctx->timeout,
@@ -589,6 +606,9 @@ new_server_ctx(int fd)
     memset(ctx, 0, sizeof(server_ctx_t));
 
     ctx->fd = fd;
+#ifdef UDP_RESPONSE_BATCH_SIZE
+    ctx->udp_gro = enable_udp_gro(fd);
+#endif
 
     ev_io_init(&ctx->io, server_recv_cb, fd, EV_READ);
 
@@ -1130,11 +1150,58 @@ CLEAN_UP:
 }
 
 #ifdef UDP_RESPONSE_BATCH_SIZE
+/* Keep the ordinary receive buffer first and borrow overflow space only for GRO. */
+#define UDP_GRO_PAYLOAD_CAPACITY 65536
+struct udp_gro_storage {
+    char tail[UDP_RESPONSE_BATCH_SIZE][UDP_GRO_PAYLOAD_CAPACITY];
+};
+
+struct udp_receive_result {
+    struct sockaddr_storage address;
+    const char *tail;
+    int segment_size; /* 0 for an ordinary datagram, -1 for an invalid aggregate */
+};
+
 static int
-receive_udp_batch(int fd, buffer_t **buffers, struct sockaddr_storage *addresses, const char *error)
+udp_gro_segment_size(struct msghdr *header)
+{
+    if (header->msg_flags & MSG_CTRUNC) {
+        return -1;
+    }
+#ifdef UDP_GRO
+    for (struct cmsghdr *msg = CMSG_FIRSTHDR(header); msg != NULL;
+         msg = CMSG_NXTHDR(header, msg)) {
+        if (msg->cmsg_level == IPPROTO_UDP && msg->cmsg_type == UDP_GRO) {
+            int size;
+            if (msg->cmsg_len != CMSG_LEN(sizeof(size)) || (header->msg_flags & MSG_TRUNC)) {
+                return -1;
+            }
+            memcpy(&size, CMSG_DATA(msg), sizeof(size));
+            return size > 0 && size <= MAX_UDP_PACKET_SIZE ? size : -1;
+        }
+    }
+#endif
+    return 0;
+}
+
+static int
+receive_udp_batch(int fd, server_ctx_t *server_ctx, bool gro, buffer_t **buffers,
+                  struct udp_receive_result *received, const char *error)
 {
     struct mmsghdr messages[UDP_RESPONSE_BATCH_SIZE];
-    struct iovec iov[UDP_RESPONSE_BATCH_SIZE];
+    struct iovec iov[UDP_RESPONSE_BATCH_SIZE][2];
+    union {
+        struct cmsghdr align;
+        unsigned char data[CMSG_SPACE(sizeof(int))];
+    } control[UDP_RESPONSE_BATCH_SIZE];
+
+    size_t tail_size = 0;
+    if (gro && (size_t)buf_size < UDP_GRO_PAYLOAD_CAPACITY) {
+        if (server_ctx->gro_storage == NULL) {
+            server_ctx->gro_storage = ss_malloc(sizeof(*server_ctx->gro_storage));
+        }
+        tail_size = UDP_GRO_PAYLOAD_CAPACITY - (size_t)buf_size;
+    }
 
     for (unsigned int i = 0; i < UDP_RESPONSE_BATCH_SIZE; i++) {
         buffer_t **slot = &buffers[i];
@@ -1144,15 +1211,21 @@ receive_udp_batch(int fd, buffer_t **buffers, struct sockaddr_storage *addresses
         } else if ((*slot)->capacity < (size_t)buf_size) {
             brealloc(*slot, buf_size, buf_size);
         }
-        iov[i] = (struct iovec){ .iov_base = (*slot)->data, .iov_len = buf_size };
+        iov[i][0] = (struct iovec){ .iov_base = (*slot)->data, .iov_len = buf_size };
         messages[i] = (struct mmsghdr){
             .msg_hdr = {
-                .msg_name = &addresses[i],
-                .msg_namelen = sizeof(addresses[i]),
-                .msg_iov = &iov[i],
+                .msg_name = &received[i].address,
+                .msg_namelen = sizeof(received[i].address),
+                .msg_iov = iov[i],
                 .msg_iovlen = 1,
+                .msg_control = gro ? control[i].data : NULL,
+                .msg_controllen = gro ? sizeof(control[i].data) : 0,
             },
         };
+        if (tail_size != 0) {
+            iov[i][1] = (struct iovec){ .iov_base = server_ctx->gro_storage->tail[i], .iov_len = tail_size };
+            messages[i].msg_hdr.msg_iovlen = 2;
+        }
     }
 
     int count = recvmmsg(fd, messages, UDP_RESPONSE_BATCH_SIZE, MSG_DONTWAIT, NULL);
@@ -1161,8 +1234,48 @@ receive_udp_batch(int fd, buffer_t **buffers, struct sockaddr_storage *addresses
     }
     for (int i = 0; i < count; i++) {
         buffers[i]->len = messages[i].msg_len;
+        received[i].segment_size = gro ? udp_gro_segment_size(&messages[i].msg_hdr) : 0;
+        received[i].tail = tail_size != 0 ? server_ctx->gro_storage->tail[i] : NULL;
     }
     return count;
+}
+
+static buffer_t *
+next_udp_datagram(buffer_t **aggregate, const struct udp_receive_result *received, size_t *offset)
+{
+    buffer_t *source = *aggregate;
+    if (source == NULL) {
+        return NULL;
+    }
+    if (received->segment_size < 0) {
+        bfree(source);
+        ss_free(*aggregate);
+        return NULL;
+    }
+    if (received->segment_size == 0 ||
+        (source->len <= (size_t)received->segment_size && source->len <= (size_t)buf_size)) {
+        source->len = min(source->len, (size_t)buf_size);
+        *aggregate = NULL;
+        return source;
+    }
+
+    size_t length = min((size_t)received->segment_size, source->len - *offset);
+    size_t head_offset = min(*offset, (size_t)buf_size);
+    size_t head_size = min(length, (size_t)buf_size - head_offset);
+    buffer_t *packet = ss_malloc(sizeof(buffer_t));
+    balloc(packet, max(length, (size_t)buf_size));
+    memcpy(packet->data, source->data + head_offset, head_size);
+    if (head_size < length) {
+        size_t tail_offset = *offset + head_size - (size_t)buf_size;
+        memcpy(packet->data + head_size, received->tail + tail_offset, length - head_size);
+    }
+    packet->len = length;
+    *offset += length;
+    if (*offset == source->len) {
+        bfree(source);
+        ss_free(*aggregate);
+    }
+    return packet;
 }
 #endif
 
@@ -1178,13 +1291,18 @@ remote_recv_cb(EV_P_ ev_io *w, int revents)
     }
 
 #ifdef UDP_RESPONSE_BATCH_SIZE
-    struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE] = {0};
-    int count = receive_udp_batch(remote_ctx->fd, server_ctx->response_read_bufs, addresses,
+    struct udp_receive_result received[UDP_RESPONSE_BATCH_SIZE] = {0};
+    int count = receive_udp_batch(remote_ctx->fd, server_ctx, remote_ctx->udp_gro,
+                                  server_ctx->response_read_bufs, received,
                                   "[udp] remote_recv_recvmmsg");
     for (int i = 0; i < count; i++) {
-        buffer_t *buf = server_ctx->response_read_bufs[i];
+        buffer_t *aggregate = server_ctx->response_read_bufs[i];
         server_ctx->response_read_bufs[i] = NULL;
-        handle_remote_response(EV_A_ remote_ctx, &addresses[i], buf);
+        size_t offset = 0;
+        buffer_t *buf;
+        while ((buf = next_udp_datagram(&aggregate, &received[i], &offset)) != NULL) {
+            handle_remote_response(EV_A_ remote_ctx, &received[i].address, buf);
+        }
     }
 #else
     struct sockaddr_storage src_addr = {0};
@@ -1650,6 +1768,9 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
                 .addr = dst_addr,
                 .offset = addr_header_len,
             };
+            if (batch->count == UDP_RESPONSE_BATCH_SIZE) {
+                flush_requests(server_ctx, batch);
+            }
             return;
         }
 #endif
@@ -1703,15 +1824,20 @@ static void
 server_recv_cb(EV_P_ ev_io *w, int revents)
 {
     server_ctx_t *server_ctx = (server_ctx_t *)w;
-    struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE] = {0};
+    struct udp_receive_result received[UDP_RESPONSE_BATCH_SIZE] = {0};
     struct udp_request_batch batch;
     batch.count = 0;
-    int count = receive_udp_batch(server_ctx->fd, server_ctx->request_read_bufs, addresses,
+    int count = receive_udp_batch(server_ctx->fd, server_ctx, server_ctx->udp_gro,
+                                  server_ctx->request_read_bufs, received,
                                   "[udp] server_recv_recvmmsg");
     for (int i = 0; i < count; i++) {
-        buffer_t *buf = server_ctx->request_read_bufs[i];
+        buffer_t *aggregate = server_ctx->request_read_bufs[i];
         server_ctx->request_read_bufs[i] = NULL;
-        handle_server_request(EV_A_ server_ctx, &addresses[i], buf, &batch);
+        size_t offset = 0;
+        buffer_t *buf;
+        while ((buf = next_udp_datagram(&aggregate, &received[i], &offset)) != NULL) {
+            handle_server_request(EV_A_ server_ctx, &received[i].address, buf, &batch);
+        }
     }
     flush_requests(server_ctx, &batch);
 }
@@ -1808,6 +1934,7 @@ free_udprelay()
             bfree(server_ctx->request_read_bufs[i]);
             ss_free(server_ctx->request_read_bufs[i]);
         }
+        ss_free(server_ctx->gro_storage);
 #endif
         close(server_ctx->fd);
         cache_delete(server_ctx->conn_cache, 0);

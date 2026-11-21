@@ -80,6 +80,8 @@ typedef struct server_ctx {
     unsigned int response_count;
     bool response_gso_unavailable;
     bool request_gso_unavailable;
+    bool udp_gro;
+    struct udp_gro_storage *gro_storage;
     struct udp_datagram responses[UDP_RESPONSE_BATCH_SIZE];
     buffer_t *response_read_bufs[UDP_RESPONSE_BATCH_SIZE];
     buffer_t *request_read_bufs[UDP_RESPONSE_BATCH_SIZE];
@@ -105,6 +107,9 @@ typedef struct remote_ctx {
     struct sockaddr_storage src_addr;
 #ifdef MODULE_REMOTE
     struct sockaddr_storage dst_addr;
+#endif
+#ifdef UDP_RESPONSE_BATCH_SIZE
+    bool udp_gro;
 #endif
     struct server_ctx *server_ctx;
 } remote_ctx_t;
