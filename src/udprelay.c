@@ -837,9 +837,9 @@ send_udp_batch(int fd, struct udp_datagram *packets, unsigned int count,
 #define UDP_GSO_MIN_SEGMENTS 4
 
 static unsigned int
-response_segment_count(struct udp_datagram *packets, unsigned int count)
+udp_segment_count(struct udp_datagram *packets, unsigned int count)
 {
-    size_t len = packets[0].buf->len;
+    size_t len = packets[0].buf->len - packets[0].offset;
     if (len == 0 || len > MAX_UDP_PACKET_SIZE / UDP_GSO_MIN_SEGMENTS) {
         return 1;
     }
@@ -851,7 +851,7 @@ response_segment_count(struct udp_datagram *packets, unsigned int count)
     unsigned int limit = MAX_UDP_PACKET_SIZE / len;
     unsigned int segments = 1;
     while (segments < count && segments < limit &&
-           packets[segments].buf->len == len &&
+           packets[segments].buf->len - packets[segments].offset == len &&
            memcmp(&packets[segments].addr, &packets[0].addr, addr_len) == 0) {
         segments++;
     }
@@ -859,14 +859,13 @@ response_segment_count(struct udp_datagram *packets, unsigned int count)
 }
 
 static bool
-send_segmented_responses(server_ctx_t *server_ctx, struct udp_datagram *packets,
-                         unsigned int count)
+send_segmented_datagrams(int fd, struct udp_datagram *packets, unsigned int count)
 {
     struct iovec iov[UDP_RESPONSE_BATCH_SIZE];
     for (unsigned int i = 0; i < count; i++) {
         iov[i] = (struct iovec){
-            .iov_base = packets[i].buf->data,
-            .iov_len = packets[i].buf->len,
+            .iov_base = packets[i].buf->data + packets[i].offset,
+            .iov_len = packets[i].buf->len - packets[i].offset,
         };
     }
 
@@ -886,46 +885,35 @@ send_segmented_responses(server_ctx_t *server_ctx, struct udp_datagram *packets,
     header->cmsg_level = IPPROTO_UDP;
     header->cmsg_type = UDP_SEGMENT;
     header->cmsg_len = CMSG_LEN(sizeof(uint16_t));
-    uint16_t segment_size = (uint16_t)packets[0].buf->len;
+    uint16_t segment_size = (uint16_t)iov[0].iov_len;
     memcpy(CMSG_DATA(header), &segment_size, sizeof(segment_size));
 
-    if (sendmsg(server_ctx->fd, &message, 0) >= 0) {
+    if (sendmsg(fd, &message, 0) >= 0) {
         free_udp_batch(packets, count);
         return true;
-    }
-    if (errno == ENOPROTOOPT) {
-        server_ctx->response_gso_unavailable = true;
     }
     return false;
 }
 #endif
 
 static void
-flush_requests(struct udp_request_batch *batch)
+send_udp_batch_with_gso(int fd, struct udp_datagram *packets, unsigned int count,
+                        bool *gso_unavailable, const char *error, bool ignore_would_block)
 {
-    if (batch->count != 0) {
-        send_udp_batch(batch->fd, batch->packets, batch->count, "[udp] sendto_remote", false);
-        batch->count = 0;
-    }
-}
-
-static void
-flush_responses(server_ctx_t *server_ctx)
-{
-    unsigned int count = server_ctx->response_count;
     unsigned int pending = 0;
 #ifdef UDP_SEGMENT
     unsigned int index = 0;
-    while (!server_ctx->response_gso_unavailable && count - index >= UDP_GSO_MIN_SEGMENTS) {
-        struct udp_datagram *packets = server_ctx->responses + index;
-        unsigned int segments = response_segment_count(packets, count - index);
+    while (!*gso_unavailable && count - index >= UDP_GSO_MIN_SEGMENTS) {
+        unsigned int segments = udp_segment_count(packets + index, count - index);
         if (segments >= UDP_GSO_MIN_SEGMENTS) {
             if (pending < index) {
-                send_udp_batch(server_ctx->fd, server_ctx->responses + pending, index - pending,
-                               "[udp] remote_recv_sendto", true);
+                send_udp_batch(fd, packets + pending, index - pending, error, ignore_would_block);
             }
-            if (!send_segmented_responses(server_ctx, packets, segments)) {
-                send_udp_batch(server_ctx->fd, packets, segments, "[udp] remote_recv_sendto", true);
+            if (!send_segmented_datagrams(fd, packets + index, segments)) {
+                if (errno == ENOPROTOOPT) {
+                    *gso_unavailable = true;
+                }
+                send_udp_batch(fd, packets + index, segments, error, ignore_would_block);
             }
             pending = index + segments;
         }
@@ -933,9 +921,25 @@ flush_responses(server_ctx_t *server_ctx)
     }
 #endif
     if (pending < count) {
-        send_udp_batch(server_ctx->fd, server_ctx->responses + pending, count - pending,
-                       "[udp] remote_recv_sendto", true);
+        send_udp_batch(fd, packets + pending, count - pending, error, ignore_would_block);
     }
+}
+
+static void
+flush_requests(server_ctx_t *server_ctx, struct udp_request_batch *batch)
+{
+    if (batch->count != 0) {
+        send_udp_batch_with_gso(batch->fd, batch->packets, batch->count,
+                               &server_ctx->request_gso_unavailable, "[udp] sendto_remote", false);
+        batch->count = 0;
+    }
+}
+
+static void
+flush_responses(server_ctx_t *server_ctx)
+{
+    send_udp_batch_with_gso(server_ctx->fd, server_ctx->responses, server_ctx->response_count,
+                           &server_ctx->response_gso_unavailable, "[udp] remote_recv_sendto", true);
     server_ctx->response_count = 0;
 }
 
@@ -1591,7 +1595,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     } else {
 #ifdef UDP_RESPONSE_BATCH_SIZE
         /* A cache insertion can evict the socket used by the pending batch. */
-        flush_requests(batch);
+        flush_requests(server_ctx, batch);
 #endif
         if (dst_addr.ss_family == AF_INET || dst_addr.ss_family == AF_INET6) {
             int remotefd = create_remote_socket(dst_addr.ss_family == AF_INET6);
@@ -1638,7 +1642,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
 #ifdef UDP_RESPONSE_BATCH_SIZE
         if (cache_hit) {
             if (batch->count != 0 && batch->fd != remote_ctx->fd) {
-                flush_requests(batch);
+                flush_requests(server_ctx, batch);
             }
             batch->fd = remote_ctx->fd;
             batch->packets[batch->count++] = (struct udp_datagram){
@@ -1672,7 +1676,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
     } else {
 #ifdef UDP_RESPONSE_BATCH_SIZE
-        flush_requests(batch);
+        flush_requests(server_ctx, batch);
 #endif
         struct query_ctx *query_ctx = new_query_ctx(buf->data + addr_header_len,
                                                     buf->len - addr_header_len);
@@ -1709,7 +1713,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         server_ctx->request_read_bufs[i] = NULL;
         handle_server_request(EV_A_ server_ctx, &addresses[i], buf, &batch);
     }
-    flush_requests(&batch);
+    flush_requests(server_ctx, &batch);
 }
 #endif
 
