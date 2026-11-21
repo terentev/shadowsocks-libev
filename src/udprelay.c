@@ -771,11 +771,42 @@ void convert_ipv4_mapped_ipv6(struct sockaddr_storage* addr) {
 }
 
 #ifdef UDP_RESPONSE_BATCH_SIZE
-struct udp_request_batch {
+struct udp_request_group {
     int fd;
+    unsigned int first;
+    unsigned int last;
     unsigned int count;
+};
+
+struct udp_request_batch {
+    unsigned int count;
+    unsigned int group_count;
+    struct udp_request_group groups[UDP_RESPONSE_BATCH_SIZE];
+    unsigned int next[UDP_RESPONSE_BATCH_SIZE];
     struct udp_datagram packets[UDP_RESPONSE_BATCH_SIZE];
 };
+
+static void
+queue_request(struct udp_request_batch *batch, int fd, buffer_t *buf,
+              const struct sockaddr_storage *addr, size_t offset)
+{
+    unsigned int index = 0;
+    while (index < batch->group_count && batch->groups[index].fd != fd) {
+        index++;
+    }
+
+    unsigned int slot = batch->count++;
+    struct udp_request_group *group = &batch->groups[index];
+    if (index == batch->group_count) {
+        *group = (struct udp_request_group){ .fd = fd, .first = slot, .last = slot, .count = 1 };
+        batch->group_count++;
+    } else {
+        batch->next[group->last] = slot;
+        group->last = slot;
+        group->count++;
+    }
+    batch->packets[slot] = (struct udp_datagram){ .buf = buf, .addr = *addr, .offset = offset };
+}
 
 static void
 free_udp_batch(struct udp_datagram *packets, unsigned int count)
@@ -928,11 +959,27 @@ send_udp_batch_with_gso(int fd, struct udp_datagram *packets, unsigned int count
 static void
 flush_requests(server_ctx_t *server_ctx, struct udp_request_batch *batch)
 {
-    if (batch->count != 0) {
-        send_udp_batch_with_gso(batch->fd, batch->packets, batch->count,
+    struct udp_datagram reordered[UDP_RESPONSE_BATCH_SIZE];
+    for (unsigned int i = 0; i < batch->group_count; i++) {
+        const struct udp_request_group *group = &batch->groups[i];
+        struct udp_datagram *packets = batch->packets + group->first;
+        if (group->last - group->first + 1 != group->count) {
+            /* Gather interleaved packets in their original socket order. */
+            unsigned int slot = group->first;
+            for (unsigned int j = 0; ; j++) {
+                reordered[j] = batch->packets[slot];
+                if (slot == group->last) {
+                    break;
+                }
+                slot = batch->next[slot];
+            }
+            packets = reordered;
+        }
+        send_udp_batch_with_gso(group->fd, packets, group->count,
                                &server_ctx->request_gso_unavailable, "[udp] sendto_remote", false);
-        batch->count = 0;
     }
+    batch->count = 0;
+    batch->group_count = 0;
 }
 
 static void
@@ -1594,7 +1641,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
         }
     } else {
 #ifdef UDP_RESPONSE_BATCH_SIZE
-        /* A cache insertion can evict the socket used by the pending batch. */
+        /* A cache insertion can evict a socket with pending datagrams. */
         flush_requests(server_ctx, batch);
 #endif
         if (dst_addr.ss_family == AF_INET || dst_addr.ss_family == AF_INET6) {
@@ -1641,15 +1688,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     if (remote_ctx != NULL && !need_query) {
 #ifdef UDP_RESPONSE_BATCH_SIZE
         if (cache_hit) {
-            if (batch->count != 0 && batch->fd != remote_ctx->fd) {
-                flush_requests(server_ctx, batch);
-            }
-            batch->fd = remote_ctx->fd;
-            batch->packets[batch->count++] = (struct udp_datagram){
-                .buf = buf,
-                .addr = dst_addr,
-                .offset = addr_header_len,
-            };
+            queue_request(batch, remote_ctx->fd, buf, &dst_addr, addr_header_len);
             return;
         }
 #endif
@@ -1706,6 +1745,7 @@ server_recv_cb(EV_P_ ev_io *w, int revents)
     struct sockaddr_storage addresses[UDP_RESPONSE_BATCH_SIZE] = {0};
     struct udp_request_batch batch;
     batch.count = 0;
+    batch.group_count = 0;
     int count = receive_udp_batch(server_ctx->fd, server_ctx->request_read_bufs, addresses,
                                   "[udp] server_recv_recvmmsg");
     for (int i = 0; i < count; i++) {
